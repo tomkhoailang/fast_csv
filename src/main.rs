@@ -245,44 +245,12 @@ fn main() {
         .compression_method(compression_method)
         .compression_level(level);
 
-    // Static Metadata Files
-    let ct_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-        <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
-        <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
-        <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
-        <Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>\
-        <Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>\
-        <Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>\
-        <Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>\
-        </Types>";
-    zip.start_file("[Content_Types].xml", zip_options).unwrap();
-    zip.write_all(ct_xml.as_bytes()).unwrap();
-
     let rels_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
         <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
         <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>\
         </Relationships>";
     zip.start_file("_rels/.rels", zip_options).unwrap();
     zip.write_all(rels_xml.as_bytes()).unwrap();
-
-    let wb_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-        <workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
-        <sheets>\
-        <sheet name=\"Sheet 1\" sheetId=\"1\" r:id=\"rId1\"/>\
-        <sheet name=\"Sheet 2\" sheetId=\"2\" r:id=\"rId2\"/>\
-        </sheets>\
-        </workbook>";
-    zip.start_file("xl/workbook.xml", zip_options).unwrap();
-    zip.write_all(wb_xml.as_bytes()).unwrap();
-
-    let wb_rels_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-        <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
-        <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>\
-        <Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet2.xml\"/>\
-        <Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>\
-        </Relationships>";
-    zip.start_file("xl/_rels/workbook.xml.rels", zip_options).unwrap();
-    zip.write_all(wb_rels_xml.as_bytes()).unwrap();
 
     let styles_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
         <styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
@@ -328,6 +296,33 @@ fn main() {
     }
 
     zip.write_all(b"</sheetData></worksheet>").unwrap();
+
+    // Dynamically write [Content_Types].xml, xl/workbook.xml, and xl/_rels/workbook.xml.rels for exact number of created sheets
+    let mut ct_xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\n<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n<Default Extension=\"xml\" ContentType=\"application/xml\"/>\n<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>\n<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>\n");
+    for s in 1..=current_sheet {
+        ct_xml.push_str(&format!("<Override PartName=\"/xl/worksheets/sheet{}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>\n", s));
+    }
+    ct_xml.push_str("</Types>");
+    zip.start_file("[Content_Types].xml", zip_options).unwrap();
+    zip.write_all(ct_xml.as_bytes()).unwrap();
+
+    let mut wb_xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\n<sheets>\n");
+    for s in 1..=current_sheet {
+        wb_xml.push_str(&format!("<sheet name=\"Sheet {}\" sheetId=\"{}\" r:id=\"rId{}\"/>\n", s, s, s));
+    }
+    wb_xml.push_str("</sheets>\n</workbook>");
+    zip.start_file("xl/workbook.xml", zip_options).unwrap();
+    zip.write_all(wb_xml.as_bytes()).unwrap();
+
+    let mut wb_rels_xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n");
+    for s in 1..=current_sheet {
+        wb_rels_xml.push_str(&format!("<Relationship Id=\"rId{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{}.xml\"/>\n", s, s));
+    }
+    wb_rels_xml.push_str(&format!("<Relationship Id=\"rId{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>\n", current_sheet + 1));
+    wb_rels_xml.push_str("</Relationships>");
+    zip.start_file("xl/_rels/workbook.xml.rels", zip_options).unwrap();
+    zip.write_all(wb_rels_xml.as_bytes()).unwrap();
+
     zip.finish().unwrap();
     producer_handle.join().unwrap();
 
@@ -340,6 +335,7 @@ fn main() {
     println!("\n========================================================");
     println!("[SUMMARY] Total Rows Processed : {}", total_rows_processed);
     println!("[SUMMARY] Output Excel File    : {} ({:.2} MB)", output_path, file_size_mb);
+    println!("[SUMMARY] Worksheets Generated : {} sheet(s)", current_sheet);
     println!("[TIMING] Header & Classify     : {:.4}s", t_hdr.as_secs_f64());
     println!("[TIMING] Pipelined Stream Write: {:.4}s", t_write.as_secs_f64());
     println!("[TOTAL TIME] Completed in      : {:.4}s", t_global.as_secs_f64());
