@@ -1,8 +1,8 @@
 # 🚀 `fast_csv` — Ultra-Fast CSV & Direct Stdin Stream to XLSX Converter Engine
 
-[![Language: Rust](https://img.shields.io/badge/Language-Rust-orange.svg)](https://www.rust-lang.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Performance: 750k rows/s](https://img.shields.io/badge/Performance-758%2C960%20rows%2Fsec-brightgreen.svg)]()
+![Language: Rust](https://img.shields.io/badge/Language-Rust-orange.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Performance: 750k rows/s](https://img.shields.io/badge/Performance-758%2C960%20rows%2Fsec-brightgreen.svg)
 
 `fast_csv` is a high-performance C-native / Rust OpenXML engine designed for zero-copy, memory-capped conversion of multi-gigabyte database streams and split CSV files into single or multi-sheet Excel (`.xlsx`) files.
 
