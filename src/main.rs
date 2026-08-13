@@ -6,7 +6,6 @@ use std::thread;
 use std::time::Instant;
 
 use csv::ByteRecord;
-use rayon::prelude::*;
 use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
 
@@ -25,13 +24,14 @@ fn get_col_letter(mut col_idx: usize) -> String {
 
 #[inline(always)]
 fn escape_xml_bytes(s: &[u8], out: &mut String) {
-    for &b in s {
-        match b {
-            b'&' => out.push_str("&amp;"),
-            b'<' => out.push_str("&lt;"),
-            b'>' => out.push_str("&gt;"),
-            b'"' => out.push_str("&quot;"),
-            _ => out.push(b as char),
+    let s_str = std::str::from_utf8(s).unwrap_or("");
+    for c in s_str.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
         }
     }
 }
@@ -123,7 +123,7 @@ fn main() {
         "Deflate Level 1 (Fast Compression)"
     };
 
-    println!("[START] Parallel Multi-Threaded CSV-to-XML Engine [{}]", mode_label);
+    println!("[START] Sequential Order Pipelined CSV-to-XML Engine [{}]", mode_label);
 
     // 1. Header Alignment
     let t_hdr_start = Instant::now();
@@ -163,80 +163,76 @@ fn main() {
     let csv_files_clone = csv_files.clone();
     let headers_clone = headers.clone();
 
-    // Spawns parallel CSV reader + XML formatter threads (1 thread per CSV file)
+    // Spawns sequential producer thread preserving strict file order
     let producer_handle = thread::spawn(move || {
-        csv_files_clone
-            .par_iter()
-            .enumerate()
-            .for_each(|(f_idx, path)| {
-                let mut rdr = csv::ReaderBuilder::new()
-                    .has_headers(true)
-                    .flexible(true)
-                    .from_path(path)
-                    .unwrap_or_else(|e| panic!("Failed to open CSV file {}: {}", path, e));
+        for (f_idx, path) in csv_files_clone.iter().enumerate() {
+            let mut rdr = csv::ReaderBuilder::new()
+                .has_headers(true)
+                .flexible(true)
+                .from_path(path)
+                .unwrap_or_else(|e| panic!("Failed to open CSV file {}: {}", path, e));
 
-                let file_headers = &file_headers_list[f_idx];
-                let header_map: Vec<usize> = file_headers
-                    .iter()
-                    .map(|fh| headers_clone.iter().position(|h| h == fh).unwrap())
-                    .collect();
+            let file_headers = &file_headers_list[f_idx];
+            let header_map: Vec<usize> = file_headers
+                .iter()
+                .map(|fh| headers_clone.iter().position(|h| h == fh).unwrap())
+                .collect();
 
-                let mut record = ByteRecord::new();
-                let chunk_row_limit = 25_000;
-                let mut buf = String::with_capacity(chunk_row_limit * 150);
-                let mut row_count = 0;
+            let mut record = ByteRecord::new();
+            let chunk_row_limit = 25_000;
+            let mut buf = String::with_capacity(chunk_row_limit * 150);
+            let mut row_count = 0;
 
-                while rdr.read_byte_record(&mut record).unwrap_or(false) {
-                    buf.push_str("<row>");
+            while rdr.read_byte_record(&mut record).unwrap_or(false) {
+                buf.push_str("<row>");
 
-                    let record_len = record.len();
-                    for target_idx in 0..headers_clone.len() {
-                        let mut val_bytes: &[u8] = b"";
-                        for (orig_idx, &mapped_target) in header_map.iter().enumerate() {
-                            if mapped_target == target_idx && orig_idx < record_len {
-                                val_bytes = record.get(orig_idx).unwrap_or(b"");
-                                break;
-                            }
-                        }
-
-                        if val_bytes.is_empty() {
-                            buf.push_str("<c/>");
-                            continue;
-                        }
-
-                        if col_types[target_idx] == ColType::Numeric {
-                            buf.push_str("<c><v>");
-                            buf.push_str(std::str::from_utf8(val_bytes).unwrap_or(""));
-                            buf.push_str("</v></c>");
-                        } else {
-                            buf.push_str("<c t=\"inlineStr\"><is><t>");
-                            escape_xml_bytes(val_bytes, &mut buf);
-                            buf.push_str("</t></is></c>");
-                        }
-                    }
-
-                    buf.push_str("</row>");
-                    row_count += 1;
-
-                    if row_count == chunk_row_limit {
-                        let xml_data = std::mem::replace(&mut buf, String::with_capacity(chunk_row_limit * 150)).into_bytes();
-                        tx.send(FileXmlChunkMessage {
-                            rows_count: row_count,
-                            xml_data,
-                        })
-                        .unwrap();
-                        row_count = 0;
+                let mut aligned_bytes = vec![b"".as_slice(); headers_clone.len()];
+                for (orig_idx, val_bytes) in record.iter().enumerate() {
+                    if orig_idx < header_map.len() {
+                        let target_idx = header_map[orig_idx];
+                        aligned_bytes[target_idx] = val_bytes;
                     }
                 }
 
-                if !buf.is_empty() {
+                for (target_idx, val_bytes) in aligned_bytes.into_iter().enumerate() {
+                    if val_bytes.is_empty() {
+                        buf.push_str("<c/>");
+                        continue;
+                    }
+
+                    if col_types[target_idx] == ColType::Numeric {
+                        buf.push_str("<c><v>");
+                        buf.push_str(std::str::from_utf8(val_bytes).unwrap_or(""));
+                        buf.push_str("</v></c>");
+                    } else {
+                        buf.push_str("<c t=\"inlineStr\"><is><t>");
+                        escape_xml_bytes(val_bytes, &mut buf);
+                        buf.push_str("</t></is></c>");
+                    }
+                }
+
+                buf.push_str("</row>");
+                row_count += 1;
+
+                if row_count == chunk_row_limit {
+                    let xml_data = std::mem::replace(&mut buf, String::with_capacity(chunk_row_limit * 150)).into_bytes();
                     tx.send(FileXmlChunkMessage {
                         rows_count: row_count,
-                        xml_data: buf.into_bytes(),
+                        xml_data,
                     })
                     .unwrap();
+                    row_count = 0;
                 }
-            });
+            }
+
+            if !buf.is_empty() {
+                tx.send(FileXmlChunkMessage {
+                    rows_count: row_count,
+                    xml_data: buf.into_bytes(),
+                })
+                .unwrap();
+            }
+        }
     });
 
     println!("[WRITE] Pipelined Stream Engine writing to: {}...", output_path);
