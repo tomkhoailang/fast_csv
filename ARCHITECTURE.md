@@ -19,41 +19,20 @@ Standard Excel libraries (like Pandas or `openpyxl`) build the entire 2D/3D tabl
 
 ### 2. Our Bounded Buffer Splitting Solution
 
+```mermaid
+flowchart LR
+    Stdin["Stdin Stream"] -->|"Fixed 2 MB Input Buffer"| BufReader["BufReader(2MB, StdinLock)"]
+    BufReader -->|"Parses rows"| ProducerBuf["Producer Buffer (25,000 Rows)\n~3.75 MB / Chunk"]
+    ProducerBuf -->|"tx.send(chunk)"| Channel["Bounded Channel sync_channel(16)\nMax 16 Chunks in RAM (~60 MB RAM Cap)"]
+    Channel -->|"rx.recv(chunk)"| Writer["Writer Thread (Main)\nZlib Deflate Level 1 -> Disk"]
+    Writer --> Output["output_file.xlsx"]
+
+    classDef memoryCap fill:#e6f3ff,stroke:#0066cc,stroke-width:2px;
+    class Channel memoryCap;
 ```
-                                  FIXED MEMORY BOUNDARY (~60 MB MAX RAM)
-┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                                                                                       │
-│  [ Stdin Stream ]                                                                                     │
-│        │                                                                                              │
-│        ▼ (Fixed 2 MB Input Buffer)                                                                    │
-│  ┌───────────────────────────────┐                                                                    │
-│  │ BufReader(2MB, StdinLock)     │                                                                    │
-│  └─────────────┬─────────────────┘                                                                    │
-│                │                                                                                      │
-│                ▼ Parses rows                                                                          │
-│  ┌───────────────────────────────┐                                                                    │
-│  │ Producer Buffer (25,000 Rows) │ ◄── [Chunk Buffer Splitting: Swapped & cleared every 25,000 rows]     │
-│  └─────────────┬─────────────────┘     (~3.75 MB per XML Chunk Buffer)                                │
-│                │                                                                                      │
-│                ▼ tx.send(chunk)                                                                       │
-│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐  │
-│  │ BOUNDED SYNCHRONOUS CHANNEL: sync_channel::<PipeStreamMessage>(16)                             │  │
-│  │  [ Chunk 1 ] [ Chunk 2 ] [ Chunk 3 ] ... [ Chunk 16 ]                                           │  │
-│  │  (Max 16 Chunks In Flight = 16 × 3.75 MB = ~60 MB)                                               │  │
-│  │                                                                                                 │  │
-│  │  ⚠️ AUTOMATIC BACKPRESSURE: If 16 chunks fill the channel, tx.send() BLOCKS the Producer        │  │
-│  │     Thread until the Writer Thread consumes a chunk and compresses it to disk!                  │  │
-│  └──────────────────────────────────────────────┬──────────────────────────────────────────────────┘  │
-│                                                 │                                                     │
-│                                                 ▼ rx.recv(chunk)                                      │
-│  ┌──────────────────────────────────────────────┴──────────────────────────────────────────────────┐  │
-│  │ Writer Thread (Main): Compress Chunk via Zlib Deflate Level 1 -> Write to Disk                  │  │
-│  └──────────────────────────────────────────────┬──────────────────────────────────────────────────┘  │
-│                                                 │                                                     │
-└─────────────────────────────────────────────────┼─────────────────────────────────────────────────────┘
-                                                  ▼
-                                       [ output_file.xlsx ]
-```
+
+#### Automatic Hardware Backpressure:
+If the ZIP writer thread is slower than the CSV parser, the channel reaches its 16-chunk limit. The `tx.send()` call **automatically pauses the Producer Thread** via OS thread synchronization until space frees up, guaranteeing RAM never exceeds ~60 MB!
 
 ---
 
@@ -63,91 +42,32 @@ Regardless of dataset size (**1 Million rows**, **50 Million rows**, or **1 Bill
 
 $$\text{Total Engine RAM} = \text{Input Buf (2MB)} + \Big(\text{Bounded Channel Limit (16)} \times \text{Chunk Size (3.75MB)}\Big) + \text{ZIP Compressor Buf (2MB)} \approx \mathbf{64 \text{ MB RAM}}$$
 
-#### How Buffer Splitting Works Step-by-Step:
-1. **Input Stream Buffering (2 MB):** `BufReader::with_capacity(2*1024*1024, stdin_lock)` reads raw bytes from stdin in fixed 2 MB chunks.
-2. **Row Chunk Splitting (25,000 Rows):** The Producer Thread accumulates XML cell tags into a heap buffer (`String::with_capacity(25_000 * 150)`).
-3. **Zero-Allocation Buffer Swapping:** When `row_count` reaches 25,000 rows, `std::mem::replace(&mut buf, String::with_capacity(25000 * 150))` transfers ownership of the byte array to the channel in $O(1)$ time with **zero memory copies**.
-4. **Automatic Hardware Backpressure:** If the ZIP writer thread is slower than the CSV parser, the channel reaches its 16-chunk limit. The Producer Thread is paused by OS thread synchronization until space frees up, guaranteeing RAM never exceeds ~60 MB!
-
 ---
 
 ## 🌐 Complete End-to-End System Architecture Pipeline
 
-```
-========================================================================================================================
-                                    PHASE 1: PYTHON DATABASE STREAM & NORMALIZATION
-========================================================================================================================
+```mermaid
+flowchart TD
+    subgraph Phase1["PHASE 1: Python Database Stream & Normalization"]
+        DB["SQL Server Database (SQLEXPRESS)"] -->|"ODBC Driver 17 (Bulk Vector Stream)"| ArrowODBC["arrow_odbc Reader (5,000 Rows/Batch)"]
+        ArrowODBC --> StreamNorm["prepare_stream_for_export()\n• Cast Decimal to String\n• Cast Timestamp to us"]
+        StreamNorm -->|"Subprocess Stdin Pipe IPC (2MB Buffer)"| PipeIPC["Standard Input (stdin) Pipe"]
+    end
 
-  [ SQL Server Database / SQLEXPRESS ]
-                  │
-                  ▼  (ODBC Driver 17 - C-Native Bulk Vector Stream)
-       ┌────────────────────────────────────────────────────────┐
-       │ arrow_odbc.read_arrow_batches_from_odbc()               │
-       │  • Batch Size: 5,000 Rows                              │
-       │  • Concurrency: Fetching Active                        │
-       │  • Measure Time To First Batch (TTFB)                  │
-       └───────────────────────────┬────────────────────────────┘
-                                   │
-                                   ▼ PyArrow RecordBatch Stream
-       ┌────────────────────────────────────────────────────────┐
-       │ prepare_stream_for_export() Normalization Layer        │
-       │  • Decimal128 / Decimal256 ──► Cast to String (Scale)  │
-       │  • DATETIME2 timestamp[ns]  ──► Cast to timestamp[us]  │
-       └───────────────────────────┬────────────────────────────┘
-                                   │
-                                   ▼ Standard Input Pipe IPC (bufsize = 2 MB)
-                                   
-========================================================================================================================
-                                    PHASE 2: RUST MULTITHREADED ENGINE (fast_csv_pipe)
-========================================================================================================================
+    subgraph Phase2["PHASE 2: Rust Multithreaded Engine (fast_csv_pipe)"]
+        PipeIPC --> Producer["PRODUCER THREAD (BufReader 2MB + StdinLock)\n• PyArrow Schema Type Flags (--types N,T...)\n• XML 1.0 Control Character Filter\n• Finite Float (.is_finite()) Inspection\n• Pack 25,000 Rows into XML Chunk Buffer"]
+        Producer -->|"Bounded Channel\n(sync_channel 16 Chunks)"| Channel["sync_channel(16)\n[Max ~60MB RAM Cap]"]
+        Channel --> Writer["WRITER THREAD (Main Thread)\n• Write _rels/.rels & xl/styles.xml\n• Stream xl/worksheets/sheet1.xml\n• Auto-rotate Sheet at 1,048,575 Rows\n• Dynamic Post-Stream Metadata\n• ZIP Deflate Level 1 Compression"]
+    end
 
-  [ Standard Input (stdin) Pipe Receiver ]
-                  │
-                  ▼
-       ┌────────────────────────────────────────────────────────────────────────────────────────┐
-       │ PRODUCER THREAD (BufReader 2MB + StdinLock)                                            │
-       │  1. Column Classification: Analyze first 300 records (Numeric f64 vs InlineStr Text)   │
-       │  2. Repeated Header Filter: Skip duplicate header rows from concatenated streams      │
-       │  3. XML 1.0 Character Sanitization:                                                    │
-       │     • Strip illegal ASCII control bytes (0x00..0x1F except \t, \n, \r)                 │
-       │     • Escape XML reserved characters (&, <, >, ")                                      │
-       │  4. Finite Float Inspection:                                                           │
-       │     • Check .is_finite() ──► Write <v>123.45</v>                                       │
-       │     • NaN / Infinity      ──► Fallback to inline text <is><t>NaN</t></is>             │
-       │  5. XML Chunk Assembly: Pack 25,000 formatted rows into zero-alloc buffer               │
-       └───────────────────────────┬────────────────────────────────────────────┘
-                                   │
-                                   ▼ Bounded Channel (sync_channel 16 Chunks)
-                                   
-       ┌────────────────────────────────────────────────────────────────────────────────────────┐
-       │ WRITER THREAD (Main Thread: OpenXML Generator & ZIP Streamer)                          │
-       │  1. Static Structural Files: Write _rels/.rels and xl/styles.xml                        │
-       │  2. Worksheet Streamer: Write xl/worksheets/sheet1.xml                                  │
-       │  3. Row Limit Management:                                                              │
-       │     • Track current_sheet_rows against 1,048,575 OpenXML row limit                      │
-       │     • Auto-close </sheetData></worksheet> and create sheet2.xml on overflow             │
-       │  4. Dynamic Metadata Finalization (Post-Stream):                                       │
-       │     • Write [Content_Types].xml matching exact active sheets generated                 │
-       │     • Write xl/workbook.xml listing only active sheets                                 │
-       │     • Write xl/_rels/workbook.xml.rels with sheet relationships                        │
-       │  5. ZIP Compression: Stream via Deflate Level 1 (Fastest Compression)                  │
-       └───────────────────────────┬────────────────────────────────────────────┘
-                                   │
-                                   ▼
-========================================================================================================================
-                                    PHASE 3: OUTPUT ARTIFACT & TELEMETRY
-========================================================================================================================
+    subgraph Phase3["PHASE 3: Output Artifact & Telemetry"]
+        Writer --> ExcelFile["output_file.xlsx"]
+        ExcelFile --> Telemetry["TELEMETRY BREAKDOWN LOGGING\n• SQL Server TTFB\n• SQL Arrow Fetch Speed\n• Excel OpenXML Pipe Conversion Speed"]
+    end
 
-                                  [ final_output_file.xlsx ]
-                                              │
-                                              ▼
-       ┌────────────────────────────────────────────────────────────────────────────────────────┐
-       │ TELEMETRY BREAKDOWN LOGGING                                                            │
-       │  1. SQL Server TTFB (First Batch Time)                                                 │
-       │  2. SQL Fetch & Arrow Ingestion Speed (Rows/sec)                                       │
-       │  3. Excel OpenXML Pipe Conversion Speed (Rows/sec)                                     │
-       │  4. Step Progress Updates (SQL Fetch vs Rust Pipe time per milestone)                   │
-       └────────────────────────────────────────────────────────────────────────────────────────┘
+    style Phase1 fill:#f9f9f9,stroke:#333,stroke-width:1px
+    style Phase2 fill:#eef9ff,stroke:#0066cc,stroke-width:1px
+    style Phase3 fill:#f0fff0,stroke:#009900,stroke-width:1px
 ```
 
 ---
@@ -164,7 +84,7 @@ $$\text{Total Engine RAM} = \text{Input Buf (2MB)} + \Big(\text{Bounded Channel 
 
 ### 3. Rust Producer Thread (`BufReader` + Column Inference)
 * **Stdin Locking:** Locks `stdin` inside the spawned thread closure (`std::io::stdin().lock()`) to ensure thread-safe ingestion.
-* **Auto Type Classification:** Inspects the first 300 rows to differentiate numeric float columns from text columns.
+* **Direct PyArrow Schema Flags:** Receives `--types N,T,N,T...` directly from Python PyArrow schema. Starts streaming on Row 1 with zero sample row delay!
 * **Finite Float Inspection:** Evaluates numeric values using `.is_finite()`. Valid floats write to `<c><v>...</v></c>`, while `NaN` / `Infinity` gracefully fall back to inline string tags `<is><t>NaN</t></is>` without corrupting Excel.
 * **XML 1.0 Sanitization:** Strips illegal control characters (`0x00..0x1F` except `\t`, `\n`, `\r`) to guarantee 100% Excel compatibility and prevent "Repaired Records" warnings.
 
