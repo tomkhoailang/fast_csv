@@ -61,8 +61,27 @@ fn main() {
 
     let filtered_args: Vec<String> = args.into_iter().filter(|a| a != "--store").collect();
 
-    let output_path = if filtered_args.len() >= 3 && filtered_args[1] == "-o" {
-        filtered_args[2].clone()
+    let explicit_types: Option<Vec<ColType>> = if let Some(pos) = filtered_args.iter().position(|a| a == "--types") {
+        if pos + 1 < filtered_args.len() {
+            Some(
+                filtered_args[pos + 1]
+                    .split(',')
+                    .map(|t| if t.trim() == "N" { ColType::Numeric } else { ColType::Text })
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let output_path = if let Some(pos) = filtered_args.iter().position(|a| a == "-o") {
+        if pos + 1 < filtered_args.len() {
+            filtered_args[pos + 1].clone()
+        } else {
+            "output/piped_output.xlsx".to_string()
+        }
     } else if filtered_args.len() >= 2 && !filtered_args[1].starts_with('-') {
         filtered_args[1].clone()
     } else {
@@ -76,6 +95,11 @@ fn main() {
     };
 
     println!("[START] Dedicated Stdin Pipe Engine [{}]", mode_label);
+    if explicit_types.is_some() {
+        println!("[SCHEMA] Exact PyArrow column types provided (Zero sample buffering!)");
+    } else {
+        println!("[SCHEMA] Auto-classifying column types from first 300 rows...");
+    }
     println!("[INPUT STREAM] Listening on Stdin pipe...");
     println!("[OUTPUT FILE] Writing XLSX to: {}", output_path);
 
@@ -101,13 +125,21 @@ fn main() {
         let num_cols = headers.len();
         tx.send(PipeStreamMessage::Header(headers)).unwrap();
 
+        let (mut col_types, mut classified) = if let Some(types) = explicit_types {
+            if types.len() == num_cols {
+                (types, true)
+            } else {
+                (vec![ColType::Text; num_cols], false)
+            }
+        } else {
+            (vec![ColType::Text; num_cols], false)
+        };
+
         let mut record = ByteRecord::new();
         let chunk_row_limit = 25_000;
         let mut buf = String::with_capacity(chunk_row_limit * 150);
         let mut row_count = 0;
         let mut sample_records = Vec::new();
-        let mut col_types = vec![ColType::Text; num_cols];
-        let mut classified = false;
 
         while rdr.read_byte_record(&mut record).unwrap_or(false) {
             // Skip repeated header rows from concatenated CSV streams
