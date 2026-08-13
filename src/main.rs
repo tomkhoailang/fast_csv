@@ -142,10 +142,21 @@ struct RowChunkMessage {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let (csv_files, output_path) = if args.len() >= 3 && args[1] == "-o" {
-        (args[3..].to_vec(), args[2].clone())
-    } else if args.len() >= 2 {
-        (args[1..].to_vec(), "output_fast.xlsx".to_string())
+
+    // Check compression flag
+    let use_store_mode = args.iter().any(|a| a == "--store");
+    let (compression_method, level) = if use_store_mode {
+        (CompressionMethod::Stored, None)
+    } else {
+        (CompressionMethod::Deflated, Some(1)) // Fast Deflate Level 1 (Default)
+    };
+
+    let mut filtered_args: Vec<String> = args.into_iter().filter(|a| a != "--store").collect();
+
+    let (csv_files, output_path) = if filtered_args.len() >= 3 && filtered_args[1] == "-o" {
+        (filtered_args[3..].to_vec(), filtered_args[2].clone())
+    } else if filtered_args.len() >= 2 {
+        (filtered_args[1..].to_vec(), "output_fast.xlsx".to_string())
     } else {
         (
             vec![
@@ -157,10 +168,16 @@ fn main() {
         )
     };
 
-    println!("[START] Pipelined Stream Engine (Zero RAM Bottleneck)");
+    let mode_desc = if use_store_mode {
+        "ZIP_STORED (Uncompressed, Max Speed)"
+    } else {
+        "Deflate Level 1 (Fast Compression, ~180MB File Size)"
+    };
+
+    println!("[START] Pipelined Stream Engine [{}]", mode_desc);
     let t_start = Instant::now();
 
-    // 1. First Pass: Collect Aligned Headers Across Files
+    // 1. Collect Aligned Headers Across Files
     let mut headers = Vec::new();
     let mut header_set = HashSet::new();
     let mut file_headers_list = Vec::new();
@@ -270,7 +287,10 @@ fn main() {
     println!("[WRITE] Streaming Pipelined XLSX to: {}...", output_path);
     let file = std::fs::File::create(&output_path).expect("Failed to create output file");
     let mut zip = zip::ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+
+    let options = SimpleFileOptions::default()
+        .compression_method(compression_method)
+        .compression_level(level);
 
     let mut sheets_created = HashSet::new();
     let mut total_rows_processed = 0;
@@ -282,7 +302,6 @@ fn main() {
         if !sheets_created.contains(&sheet_num) {
             sheets_created.insert(sheet_num);
 
-            // Write minimal workbook metadata on first sheet creation
             if sheet_num == 1 {
                 let ct_xml = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
@@ -336,10 +355,8 @@ fn main() {
                 zip.write_all(styles_xml.as_bytes()).unwrap();
             }
 
-            // Start new worksheet file
             zip.start_file(format!("xl/worksheets/sheet{}.xml", sheet_num), options).unwrap();
 
-            // Header row
             let mut hdr_xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData><row r=\"1\">");
             for (c_idx, name) in headers.iter().enumerate() {
                 let col_let = &col_letters[c_idx];
@@ -352,7 +369,6 @@ fn main() {
             zip.write_all(hdr_xml.as_bytes()).unwrap();
         }
 
-        // Parallel Rayon render for the popped chunk
         let xml_bytes = render_chunk_parallel(&msg.records, &col_letters, &col_types, msg.chunk_start_row);
         zip.write_all(&xml_bytes).unwrap();
 
@@ -365,10 +381,11 @@ fn main() {
 
     let t_total = t_start.elapsed();
     let rows_sec = total_rows_processed as f64 / t_total.as_secs_f64();
+    let file_size_mb = std::fs::metadata(&output_path).map(|m| m.len() as f64 / (1024.0 * 1024.0)).unwrap_or(0.0);
 
     println!("\n========================================================");
     println!("[SUMMARY] Total Rows Processed : {}", total_rows_processed);
-    println!("[SUMMARY] Output Excel File    : {}", output_path);
+    println!("[SUMMARY] Output Excel File    : {} ({:.2} MB)", output_path, file_size_mb);
     println!("[STREAMING] Overlapped Read & Write Pipeline Complete");
     println!("[TOTAL TIME] Completed in      : {:.4}s", t_total.as_secs_f64());
     println!("[THROUGHPUT] Total Speed       : {:.0} rows/sec", rows_sec);
