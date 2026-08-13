@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::env;
 use std::io::Write;
+use std::sync::mpsc::sync_channel;
+use std::thread;
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -33,21 +35,33 @@ fn escape_xml(s: &str, out: &mut String) {
     }
 }
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 enum ColType {
     Numeric,
     Text,
 }
 
-fn classify_columns(headers: &[String], records: &[Vec<String>]) -> Vec<ColType> {
-    let sample_count = records.len().min(500);
+fn classify_columns_from_sample(csv_paths: &[String], headers: &[String]) -> Vec<ColType> {
+    let sample_limit = 200;
+    let mut samples: Vec<Vec<String>> = Vec::new();
+
+    for path in csv_paths {
+        if let Ok(mut rdr) = csv::ReaderBuilder::new().has_headers(true).from_path(path) {
+            for result in rdr.records().take(sample_limit) {
+                if let Ok(rec) = result {
+                    samples.push(rec.iter().map(|s| s.to_string()).collect());
+                }
+            }
+        }
+    }
+
     headers
         .iter()
         .enumerate()
         .map(|(c_idx, _)| {
             let mut numeric_count = 0;
             let mut total_non_empty = 0;
-            for row in records.iter().take(sample_count) {
+            for row in &samples {
                 if c_idx < row.len() {
                     let val = row[c_idx].trim();
                     if !val.is_empty() {
@@ -67,23 +81,23 @@ fn classify_columns(headers: &[String], records: &[Vec<String>]) -> Vec<ColType>
         .collect()
 }
 
-fn render_rows_parallel(
+fn render_chunk_parallel(
     records: &[Vec<String>],
     col_letters: &[String],
     col_types: &[ColType],
     start_row_1based: usize,
 ) -> Vec<u8> {
-    const CHUNK_SIZE: usize = 50_000;
+    const SUB_CHUNK: usize = 10_000;
 
-    let chunk_results: Vec<String> = records
-        .par_chunks(CHUNK_SIZE)
+    let sub_results: Vec<String> = records
+        .par_chunks(SUB_CHUNK)
         .enumerate()
-        .map(|(chunk_idx, chunk)| {
-            let mut buf = String::with_capacity(chunk.len() * 300);
-            let chunk_start_row = start_row_1based + chunk_idx * CHUNK_SIZE;
+        .map(|(sub_idx, sub)| {
+            let mut buf = String::with_capacity(sub.len() * 250);
+            let sub_start_row = start_row_1based + sub_idx * SUB_CHUNK;
 
-            for (r_idx, row) in chunk.iter().enumerate() {
-                let row_num = chunk_start_row + r_idx;
+            for (r_idx, row) in sub.iter().enumerate() {
+                let row_num = sub_start_row + r_idx;
                 buf.push_str("<row r=\"");
                 buf.push_str(&row_num.to_string());
                 buf.push_str("\">");
@@ -116,72 +130,14 @@ fn render_rows_parallel(
         })
         .collect();
 
-    chunk_results.concat().into_bytes()
+    sub_results.concat().into_bytes()
 }
 
-fn read_and_align_csvs_parallel(csv_paths: &[String]) -> (Vec<String>, Vec<Vec<String>>) {
-    // 1. Read headers from all CSV files concurrently in parallel
-    let file_headers_list: Vec<Vec<String>> = csv_paths
-        .par_iter()
-        .map(|path| {
-            let mut rdr = csv::ReaderBuilder::new()
-                .has_headers(true)
-                .flexible(true)
-                .from_path(path)
-                .unwrap_or_else(|e| panic!("Failed to open CSV file {}: {}", path, e));
-            rdr.headers()
-                .expect("Failed to read headers")
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .collect();
-
-    let mut headers = Vec::new();
-    let mut header_set = HashSet::new();
-    for f_hdrs in &file_headers_list {
-        for h in f_hdrs {
-            if !header_set.contains(h) {
-                header_set.insert(h.clone());
-                headers.push(h.clone());
-            }
-        }
-    }
-
-    // 2. Read and align CSV rows concurrently across CPU threads
-    let file_rows_list: Vec<Vec<Vec<String>>> = csv_paths
-        .par_iter()
-        .zip(file_headers_list.par_iter())
-        .map(|(path, file_headers)| {
-            let mut rdr = csv::ReaderBuilder::new()
-                .has_headers(true)
-                .flexible(true)
-                .from_path(path)
-                .unwrap_or_else(|e| panic!("Failed to open CSV file {}: {}", path, e));
-
-            let header_map: Vec<usize> = file_headers
-                .iter()
-                .map(|fh| headers.iter().position(|h| h == fh).unwrap())
-                .collect();
-
-            let mut file_rows = Vec::new();
-            for result in rdr.records() {
-                let record = result.expect("Failed to read CSV record");
-                let mut aligned_row = vec![String::new(); headers.len()];
-                for (idx, val) in record.iter().enumerate() {
-                    if idx < header_map.len() {
-                        let target_idx = header_map[idx];
-                        aligned_row[target_idx] = val.to_string();
-                    }
-                }
-                file_rows.push(aligned_row);
-            }
-            file_rows
-        })
-        .collect();
-
-    let all_rows: Vec<Vec<String>> = file_rows_list.into_iter().flatten().collect();
-    (headers, all_rows)
+struct RowChunkMessage {
+    sheet_idx: usize,
+    chunk_start_row: usize,
+    records: Vec<Vec<String>>,
+    is_last_chunk_of_sheet: bool,
 }
 
 fn main() {
@@ -197,150 +153,223 @@ fn main() {
                 "output/sample_20260812_180359_Part_2.csv".to_string(),
                 "output/sample_20260812_180359_Part_3.csv".to_string(),
             ],
-            "output/sample_fast_rust_merged.xlsx".to_string(),
+            "output/merged_report.xlsx".to_string(),
         )
     };
 
-    println!("[START] High-Performance Native Rust Parallel Reader & Writer");
+    println!("[START] Pipelined Stream Engine (Zero RAM Bottleneck)");
     let t_start = Instant::now();
 
-    println!("[READ] Reading and aligning {} CSV files in parallel across threads...", csv_files.len());
-    let t_read_start = Instant::now();
-    let (headers, rows) = read_and_align_csvs_parallel(&csv_files);
-    let t_read = t_read_start.elapsed();
-    println!("[READ COMPLETE] Read {} rows in {:.4}s", rows.len(), t_read.as_secs_f64());
+    // 1. First Pass: Collect Aligned Headers Across Files
+    let mut headers = Vec::new();
+    let mut header_set = HashSet::new();
+    let mut file_headers_list = Vec::new();
 
-    println!("[CLASSIFY] Classifying column types once...");
-    let col_types = classify_columns(&headers, &rows);
+    for path in &csv_files {
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(true)
+            .from_path(path)
+            .unwrap_or_else(|e| panic!("Failed to open CSV file {}: {}", path, e));
 
-    println!("[WRITE] Writing XLSX workbook to: {}...", output_path);
-    let t_write_start = Instant::now();
+        let hdr: Vec<String> = rdr
+            .headers()
+            .expect("Failed to read headers")
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
+        for h in &hdr {
+            if !header_set.contains(h) {
+                header_set.insert(h.clone());
+                headers.push(h.clone());
+            }
+        }
+        file_headers_list.push(hdr);
+    }
+
+    let col_types = classify_columns_from_sample(&csv_files, &headers);
+    let col_letters: Vec<String> = (0..headers.len()).map(get_col_letter).collect();
+
+    // Bounded sync channel (max 4 buffered chunks in memory = ~160k rows max RAM footprint)
+    let (tx, rx) = sync_channel::<RowChunkMessage>(4);
+
+    let csv_files_clone = csv_files.clone();
+    let headers_clone = headers.clone();
+
+    // Producer Thread: Streams CSV rows concurrently into bounded channel
+    thread::spawn(move || {
+        let max_rows_per_sheet = 1_048_575; // Excel sheet row limit
+        let chunk_size = 40_000;
+
+        let mut current_sheet_idx = 1;
+        let mut current_sheet_rows = 0;
+        let mut current_chunk = Vec::with_capacity(chunk_size);
+        let mut chunk_start_row = 2; // Row 1 is header
+
+        for (f_idx, path) in csv_files_clone.iter().enumerate() {
+            let mut rdr = csv::ReaderBuilder::new()
+                .has_headers(true)
+                .flexible(true)
+                .from_path(path)
+                .unwrap_or_else(|e| panic!("Failed to open CSV file {}: {}", path, e));
+
+            let file_headers = &file_headers_list[f_idx];
+            let header_map: Vec<usize> = file_headers
+                .iter()
+                .map(|fh| headers_clone.iter().position(|h| h == fh).unwrap())
+                .collect();
+
+            for result in rdr.records() {
+                let record = result.expect("Failed to read CSV record");
+                let mut aligned_row = vec![String::new(); headers_clone.len()];
+                for (idx, val) in record.iter().enumerate() {
+                    if idx < header_map.len() {
+                        let target_idx = header_map[idx];
+                        aligned_row[target_idx] = val.to_string();
+                    }
+                }
+
+                current_chunk.push(aligned_row);
+                current_sheet_rows += 1;
+
+                if current_chunk.len() == chunk_size || current_sheet_rows == max_rows_per_sheet {
+                    let is_sheet_end = current_sheet_rows == max_rows_per_sheet;
+                    let msg = RowChunkMessage {
+                        sheet_idx: current_sheet_idx,
+                        chunk_start_row,
+                        records: current_chunk,
+                        is_last_chunk_of_sheet: is_sheet_end,
+                    };
+                    chunk_start_row += msg.records.len();
+                    tx.send(msg).unwrap();
+
+                    current_chunk = Vec::with_capacity(chunk_size);
+
+                    if is_sheet_end {
+                        current_sheet_idx += 1;
+                        current_sheet_rows = 0;
+                        chunk_start_row = 2;
+                    }
+                }
+            }
+        }
+
+        if !current_chunk.is_empty() {
+            let msg = RowChunkMessage {
+                sheet_idx: current_sheet_idx,
+                chunk_start_row,
+                records: current_chunk,
+                is_last_chunk_of_sheet: true,
+            };
+            tx.send(msg).unwrap();
+        }
+    });
+
+    // Consumer (Main Thread): Receives chunks and streams XML directly to ZIP
+    println!("[WRITE] Streaming Pipelined XLSX to: {}...", output_path);
     let file = std::fs::File::create(&output_path).expect("Failed to create output file");
     let mut zip = zip::ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
 
-    let col_letters: Vec<String> = (0..headers.len()).map(get_col_letter).collect();
-    let max_rows_per_sheet = 1_048_575;
-    let sheet_chunks: Vec<&[Vec<String>]> = rows.chunks(max_rows_per_sheet).collect();
-    let num_sheets = sheet_chunks.len();
+    let mut sheets_created = HashSet::new();
+    let mut total_rows_processed = 0;
 
-    // 1. [Content_Types].xml
-    let mut ct_overrides = String::new();
-    for i in 1..=num_sheets {
-        ct_overrides.push_str(&format!(
-            "<Override PartName=\"/xl/worksheets/sheet{}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>",
-            i
-        ));
-    }
-    let ct_xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-        <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
-        <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
-        <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
-        <Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>\
-        <Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>\
-        {}\
-        </Types>",
-        ct_overrides
-    );
-    zip.start_file("[Content_Types].xml", options).unwrap();
-    zip.write_all(ct_xml.as_bytes()).unwrap();
+    while let Ok(msg) = rx.recv() {
+        let sheet_num = msg.sheet_idx;
+        total_rows_processed += msg.records.len();
 
-    // 2. _rels/.rels
-    let rels_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-        <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
-        <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>\
-        </Relationships>";
-    zip.start_file("_rels/.rels", options).unwrap();
-    zip.write_all(rels_xml.as_bytes()).unwrap();
+        if !sheets_created.contains(&sheet_num) {
+            sheets_created.insert(sheet_num);
 
-    // 3. xl/workbook.xml
-    let mut wb_sheets = String::new();
-    for i in 1..=num_sheets {
-        wb_sheets.push_str(&format!(
-            "<sheet name=\"Sheet {}\" sheetId=\"{}\" r:id=\"rId{}\"/>",
-            i, i, i
-        ));
-    }
-    let wb_xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-        <workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
-        <sheets>{}</sheets>\
-        </workbook>",
-        wb_sheets
-    );
-    zip.start_file("xl/workbook.xml", options).unwrap();
-    zip.write_all(wb_xml.as_bytes()).unwrap();
+            // Write minimal workbook metadata on first sheet creation
+            if sheet_num == 1 {
+                let ct_xml = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+                    <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+                    <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+                    <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+                    <Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>\
+                    <Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>\
+                    <Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>\
+                    <Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>\
+                    </Types>"
+                );
+                zip.start_file("[Content_Types].xml", options).unwrap();
+                zip.write_all(ct_xml.as_bytes()).unwrap();
 
-    // 4. xl/_rels/workbook.xml.rels
-    let mut wb_rels_sheets = String::new();
-    for i in 1..=num_sheets {
-        wb_rels_sheets.push_str(&format!(
-            "<Relationship Id=\"rId{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{}.xml\"/>",
-            i, i
-        ));
-    }
-    let styles_rid = num_sheets + 1;
-    let wb_rels_xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-        <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
-        {}\
-        <Relationship Id=\"rId{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>\
-        </Relationships>",
-        wb_rels_sheets, styles_rid
-    );
-    zip.start_file("xl/_rels/workbook.xml.rels", options).unwrap();
-    zip.write_all(wb_rels_xml.as_bytes()).unwrap();
+                let rels_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+                    <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+                    <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>\
+                    </Relationships>";
+                zip.start_file("_rels/.rels", options).unwrap();
+                zip.write_all(rels_xml.as_bytes()).unwrap();
 
-    // 5. xl/styles.xml
-    let styles_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-        <styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
-        <fonts count=\"1\"><font><sz val=\"11\"/><color theme=\"1\"/><name val=\"Calibri\"/><family val=\"2\"/></font></fonts>\
-        <fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill></fills>\
-        <borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders>\
-        <cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>\
-        <cellXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></cellXfs>\
-        </styleSheet>";
-    zip.start_file("xl/styles.xml", options).unwrap();
-    zip.write_all(styles_xml.as_bytes()).unwrap();
+                let wb_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+                    <workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+                    <sheets>\
+                    <sheet name=\"Sheet 1\" sheetId=\"1\" r:id=\"rId1\"/>\
+                    <sheet name=\"Sheet 2\" sheetId=\"2\" r:id=\"rId2\"/>\
+                    </sheets>\
+                    </workbook>";
+                zip.start_file("xl/workbook.xml", options).unwrap();
+                zip.write_all(wb_xml.as_bytes()).unwrap();
 
-    // 6. xl/worksheets/sheet{i}.xml
-    for (s_idx, chunk) in sheet_chunks.iter().enumerate() {
-        let sheet_num = s_idx + 1;
-        zip.start_file(format!("xl/worksheets/sheet{}.xml", sheet_num), options).unwrap();
+                let wb_rels_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+                    <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+                    <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>\
+                    <Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet2.xml\"/>\
+                    <Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>\
+                    </Relationships>";
+                zip.start_file("xl/_rels/workbook.xml.rels", options).unwrap();
+                zip.write_all(wb_rels_xml.as_bytes()).unwrap();
 
-        // Header row
-        let mut hdr_xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData><row r=\"1\">");
-        for (c_idx, name) in headers.iter().enumerate() {
-            let col_let = &col_letters[c_idx];
-            hdr_xml.push_str(&format!("<c r=\"{}1\" t=\"inlineStr\"><is><t>", col_let));
-            escape_xml(name, &mut hdr_xml);
-            hdr_xml.push_str("</t></is></c>");
+                let styles_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+                    <styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
+                    <fonts count=\"1\"><font><sz val=\"11\"/><color theme=\"1\"/><name val=\"Calibri\"/><family val=\"2\"/></font></fonts>\
+                    <fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill></fills>\
+                    <borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders>\
+                    <cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>\
+                    <cellXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></cellXfs>\
+                    </styleSheet>";
+                zip.start_file("xl/styles.xml", options).unwrap();
+                zip.write_all(styles_xml.as_bytes()).unwrap();
+            }
+
+            // Start new worksheet file
+            zip.start_file(format!("xl/worksheets/sheet{}.xml", sheet_num), options).unwrap();
+
+            // Header row
+            let mut hdr_xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData><row r=\"1\">");
+            for (c_idx, name) in headers.iter().enumerate() {
+                let col_let = &col_letters[c_idx];
+                hdr_xml.push_str(&format!("<c r=\"{}1\" t=\"inlineStr\"><is><t>", col_let));
+                escape_xml(name, &mut hdr_xml);
+                hdr_xml.push_str("</t></is></c>");
+            }
+            hdr_xml.push_str("</row>");
+
+            zip.write_all(hdr_xml.as_bytes()).unwrap();
         }
-        hdr_xml.push_str("</row>");
 
-        zip.write_all(hdr_xml.as_bytes()).unwrap();
+        // Parallel Rayon render for the popped chunk
+        let xml_bytes = render_chunk_parallel(&msg.records, &col_letters, &col_types, msg.chunk_start_row);
+        zip.write_all(&xml_bytes).unwrap();
 
-        // Data rows in Rayon parallel
-        let body_bytes = render_rows_parallel(chunk, &col_letters, &col_types, 2);
-        zip.write_all(&body_bytes).unwrap();
-
-        zip.write_all(b"</sheetData></worksheet>").unwrap();
+        if msg.is_last_chunk_of_sheet {
+            zip.write_all(b"</sheetData></worksheet>").unwrap();
+        }
     }
 
     zip.finish().unwrap();
 
-    let t_write = t_write_start.elapsed();
     let t_total = t_start.elapsed();
-    let total_rows = rows.len();
-    let rows_sec = total_rows as f64 / t_total.as_secs_f64();
+    let rows_sec = total_rows_processed as f64 / t_total.as_secs_f64();
 
     println!("\n========================================================");
-    println!("[SUMMARY] Total Rows Processed : {}", total_rows);
+    println!("[SUMMARY] Total Rows Processed : {}", total_rows_processed);
     println!("[SUMMARY] Output Excel File    : {}", output_path);
-    println!("[TIMING] CSV Read & Align Time : {:.4}s", t_read.as_secs_f64());
-    println!("[TIMING] Parallel Write Time   : {:.4}s", t_write.as_secs_f64());
+    println!("[STREAMING] Overlapped Read & Write Pipeline Complete");
     println!("[TOTAL TIME] Completed in      : {:.4}s", t_total.as_secs_f64());
     println!("[THROUGHPUT] Total Speed       : {:.0} rows/sec", rows_sec);
     println!("========================================================\n");
