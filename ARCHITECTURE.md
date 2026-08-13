@@ -20,15 +20,12 @@ Standard Excel libraries (like Pandas or `openpyxl`) build the entire 2D/3D tabl
 ### 2. Our Bounded Buffer Splitting Solution
 
 ```mermaid
-flowchart LR
-    Stdin["Stdin Stream"] -->|"Fixed 2 MB Input Buffer"| BufReader["BufReader(2MB, StdinLock)"]
-    BufReader -->|"Parses rows"| ProducerBuf["Producer Buffer (25,000 Rows)\n~3.75 MB / Chunk"]
-    ProducerBuf -->|"tx.send(chunk)"| Channel["Bounded Channel sync_channel(16)\nMax 16 Chunks in RAM (~60 MB RAM Cap)"]
-    Channel -->|"rx.recv(chunk)"| Writer["Writer Thread (Main)\nZlib Deflate Level 1 -> Disk"]
-    Writer --> Output["output_file.xlsx"]
-
-    classDef memoryCap fill:#e6f3ff,stroke:#0066cc,stroke-width:2px;
-    class Channel memoryCap;
+graph LR
+    A["Stdin Stream"] --> B["Fixed 2 MB Input Buffer"]
+    B --> C["Producer Buffer - 25,000 Rows per Chunk"]
+    C --> D["Bounded Channel - sync_channel 16 - Max ~60 MB RAM Cap"]
+    D --> E["Writer Thread Main - Deflate Level 1 Compressor"]
+    E --> F["output_file.xlsx"]
 ```
 
 #### Automatic Hardware Backpressure:
@@ -47,27 +44,26 @@ $$\text{Total Engine RAM} = \text{Input Buf (2MB)} + \Big(\text{Bounded Channel 
 ## 🌐 Complete End-to-End System Architecture Pipeline
 
 ```mermaid
-flowchart TD
-    subgraph Phase1["PHASE 1: Python Database Stream & Normalization"]
-        DB["SQL Server Database (SQLEXPRESS)"] -->|"ODBC Driver 17 (Bulk Vector Stream)"| ArrowODBC["arrow_odbc Reader (5,000 Rows/Batch)"]
-        ArrowODBC --> StreamNorm["prepare_stream_for_export()\n• Cast Decimal to String\n• Cast Timestamp to us"]
-        StreamNorm -->|"Subprocess Stdin Pipe IPC (2MB Buffer)"| PipeIPC["Standard Input (stdin) Pipe"]
+graph TD
+    subgraph P1["PHASE 1: Python Database Stream & Normalization"]
+        A1["SQL Server Database SQLEXPRESS"] --> B1["arrow_odbc Reader - 5,000 Rows per Batch"]
+        B1 --> C1["prepare_stream_for_export Normalization Layer"]
+        C1 --> D1["Subprocess Standard Input Pipe IPC"]
     end
 
-    subgraph Phase2["PHASE 2: Rust Multithreaded Engine (fast_csv_pipe)"]
-        PipeIPC --> Producer["PRODUCER THREAD (BufReader 2MB + StdinLock)\n• PyArrow Schema Type Flags (--types N,T...)\n• XML 1.0 Control Character Filter\n• Finite Float (.is_finite()) Inspection\n• Pack 25,000 Rows into XML Chunk Buffer"]
-        Producer -->|"Bounded Channel\n(sync_channel 16 Chunks)"| Channel["sync_channel(16)\n[Max ~60MB RAM Cap]"]
-        Channel --> Writer["WRITER THREAD (Main Thread)\n• Write _rels/.rels & xl/styles.xml\n• Stream xl/worksheets/sheet1.xml\n• Auto-rotate Sheet at 1,048,575 Rows\n• Dynamic Post-Stream Metadata\n• ZIP Deflate Level 1 Compression"]
+    subgraph P2["PHASE 2: Rust Multithreaded Engine fast_csv_pipe"]
+        D1 --> A2["PRODUCER THREAD - BufReader 2MB + StdinLock"]
+        A2 --> B2["PyArrow Schema Type Flags --types N,T"]
+        B2 --> C2["XML 1.0 Control Character Filter & Finite Float Check"]
+        C2 --> D2["Bounded Channel sync_channel 16 - Max ~60MB RAM Cap"]
+        D2 --> E2["WRITER THREAD Main Thread"]
+        E2 --> F2["Worksheet Streamer & Dynamic Post-Stream Metadata"]
     end
 
-    subgraph Phase3["PHASE 3: Output Artifact & Telemetry"]
-        Writer --> ExcelFile["output_file.xlsx"]
-        ExcelFile --> Telemetry["TELEMETRY BREAKDOWN LOGGING\n• SQL Server TTFB\n• SQL Arrow Fetch Speed\n• Excel OpenXML Pipe Conversion Speed"]
+    subgraph P3["PHASE 3: Output Artifact & Telemetry"]
+        F2 --> A3["output_file.xlsx"]
+        A3 --> B3["TELEMETRY BREAKDOWN LOGGING"]
     end
-
-    style Phase1 fill:#f9f9f9,stroke:#333,stroke-width:1px
-    style Phase2 fill:#eef9ff,stroke:#0066cc,stroke-width:1px
-    style Phase3 fill:#f0fff0,stroke:#009900,stroke-width:1px
 ```
 
 ---
