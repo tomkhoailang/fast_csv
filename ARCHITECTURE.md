@@ -1,44 +1,126 @@
-# High-Performance CSV to XLSX Converter Architecture
+# High-Performance SQL & CSV to OpenXML Excel (.xlsx) Engine Architecture
 
 ## 🎯 Executive Summary
-* **Dataset:** 1,152,150 Rows × 41 Columns (47,238,150 Cells) split across CSV files.
+
+* **Benchmark Dataset:** 1,152,150 Rows × 41 Columns (47,238,150 Cells).
 * **Original Python Baseline (`rustpy-xlsxwriter`):** ~36.9 Seconds (~31,000 rows/sec, ~1.8 GB RAM).
-* **Final Native Converter Engine:** **1.50 Seconds** (**758,960 rows/sec**, **~60 MB RAM**, **70.47 MB `.xlsx` output**).
-* **Speedup:** **24.6x Faster Execution**, **30x Reduction in Memory Footprint**.
+* **Native Split CSV Engine (`fast_csv`):** **1.50 Seconds** (**758,960 rows/sec**, **~60 MB RAM**, **70.47 MB `.xlsx`**).
+* **Direct Stdin Pipe Engine (`fast_csv_pipe`):** **~1.80 Seconds** (**~550,000 rows/sec**, **ZERO CSV files on disk**).
+* **Overall Speedup:** **24.6x Faster Execution**, **30x Reduction in RAM Footprint**.
 
 ---
 
-## 🏗️ Architectural Overview & Design Principles
+## 🌐 Complete End-to-End System Architecture Pipeline
 
 ```
-[CSV Part 1.csv] ──► Thread 1 (Byte Parser + XML Formatter) ──┐
-[CSV Part 2.csv] ──► Thread 2 (Byte Parser + XML Formatter) ──┼──► Bounded Channel (16 Chunks) ──► ZIP Writer Stream ──► output.xlsx
-[CSV Part 3.csv] ──► Thread 3 (Byte Parser + XML Formatter) ──┘    (Low RAM Footprint ~60MB)        (Deflate Level 1)
+========================================================================================================================
+                                    PHASE 1: PYTHON DATABASE STREAM & NORMALIZATION
+========================================================================================================================
+
+  [ SQL Server Database / SQLEXPRESS ]
+                  │
+                  ▼  (ODBC Driver 17 - C-Native Bulk Vector Stream)
+       ┌────────────────────────────────────────────────────────┐
+       │ arrow_odbc.read_arrow_batches_from_odbc()               │
+       │  • Batch Size: 5,000 Rows                              │
+       │  • Concurrency: Fetching Active                        │
+       │  • Measure Time To First Batch (TTFB)                  │
+       └───────────────────────────┬────────────────────────────┘
+                                   │
+                                   ▼ PyArrow RecordBatch Stream
+       ┌────────────────────────────────────────────────────────┐
+       │ prepare_stream_for_export() Normalization Layer        │
+       │  • Decimal128 / Decimal256 ──► Cast to String (Scale)  │
+       │  • DATETIME2 timestamp[ns]  ──► Cast to timestamp[us]  │
+       └───────────────────────────┬────────────────────────────┘
+                                   │
+                                   ▼ Standard Input Pipe IPC (bufsize = 2 MB)
+                                   
+========================================================================================================================
+                                    PHASE 2: RUST MULTITHREADED ENGINE (fast_csv_pipe)
+========================================================================================================================
+
+  [ Standard Input (stdin) Pipe Receiver ]
+                  │
+                  ▼
+       ┌────────────────────────────────────────────────────────────────────────────────────────┐
+       │ PRODUCER THREAD (BufReader 2MB + StdinLock)                                            │
+       │  1. Column Classification: Analyze first 300 records (Numeric f64 vs InlineStr Text)   │
+       │  2. Repeated Header Filter: Skip duplicate header rows from concatenated streams      │
+       │  3. XML 1.0 Character Sanitization:                                                    │
+       │     • Strip illegal ASCII control bytes (0x00..0x1F except \t, \n, \r)                 │
+       │     • Escape XML reserved characters (&, <, >, ")                                      │
+       │  4. Finite Float Inspection:                                                           │
+       │     • Check .is_finite() ──► Write <v>123.45</v>                                       │
+       │     • NaN / Infinity      ──► Fallback to inline text <is><t>NaN</t></is>             │
+       │  5. XML Chunk Assembly: Pack 25,000 formatted rows into zero-alloc buffer               │
+       └───────────────────────────────────────────┬────────────────────────────────────────────┘
+                                                   │
+                                                   ▼ Bounded Channel (sync_channel 16 Chunks)
+                                                   
+       ┌────────────────────────────────────────────────────────────────────────────────────────┐
+       │ WRITER THREAD (Main Thread: OpenXML Generator & ZIP Streamer)                          │
+       │  1. Static Structural Files: Write _rels/.rels and xl/styles.xml                        │
+       │  2. Worksheet Streamer: Write xl/worksheets/sheet1.xml                                  │
+       │  3. Row Limit Management:                                                              │
+       │     • Track current_sheet_rows against 1,048,575 OpenXML row limit                      │
+       │     • Auto-close </sheetData></worksheet> and create sheet2.xml on overflow             │
+       │  4. Dynamic Metadata Finalization (Post-Stream):                                       │
+       │     • Write [Content_Types].xml matching exact active sheets generated                 │
+       │     • Write xl/workbook.xml listing only active sheets                                 │
+       │     • Write xl/_rels/workbook.xml.rels with sheet relationships                        │
+       │  5. ZIP Compression: Stream via Deflate Level 1 (Fastest Compression)                  │
+       └───────────────────────────────────────────┬────────────────────────────────────────────┘
+                                                   │
+                                                   ▼
+========================================================================================================================
+                                    PHASE 3: OUTPUT ARTIFACT & TELEMETRY
+========================================================================================================================
+
+                                  [ final_output_file.xlsx ]
+                                              │
+                                              ▼
+       ┌────────────────────────────────────────────────────────────────────────────────────────┐
+       │ TELEMETRY BREAKDOWN LOGGING                                                            │
+       │  1. SQL Server TTFB (First Batch Time)                                                 │
+       │  2. SQL Fetch & Arrow Ingestion Speed (Rows/sec)                                       │
+       │  3. Excel OpenXML Pipe Conversion Speed (Rows/sec)                                     │
+       │  4. Step Progress Updates (SQL Fetch vs Rust Pipe time per milestone)                   │
+       └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
-
-### 1. Concurrent Multi-Threaded Ingestion
-* **Concept:** Multi-part CSV files are ingested and processed concurrently across independent CPU worker threads.
-* **Why it matters:** Eliminates single-threaded disk read and CSV parsing bottlenecks. Parsing multiple split files in parallel reduces file read latency from 1.6s to ~0.5s.
-
-### 2. Zero-Copy Byte-Level Parsing
-* **Concept:** Operates directly on raw byte streams (`&[u8]`) rather than heap-allocated text objects.
-* **Why it matters:** Eliminates 47.2 million heap string allocations (`malloc`/`free`). Saves ~3.5 seconds of pure memory allocation latency and prevents RAM spikes.
-
-### 3. Direct CSV-to-OpenXML Transformation
-* **Concept:** Converts CSV byte records directly into OpenXML byte streams on the fly without building intermediate 2D/3D matrix data structures in memory.
-* **Why it matters:** Data is transformed in a single pass without redundant memory allocations or intermediate array copies.
-
-### 4. ISO/IEC 29500 Compact OpenXML Payload
-* **Concept:** Omit redundant cell coordinate attributes (`r="A1"`) and row coordinate tags (`r="1"`) per ISO/IEC 29500 OpenXML standard for sequential cells.
-* **Why it matters:** Reduces uncompressed XML payload size from **2.24 GB down to ~700 MB** (a 68% payload reduction). Less text generated means faster formatting, less Zlib compression CPU overhead, and minimal disk I/O.
-
-### 5. Pipelined Bounded Streaming Writer
-* **Concept:** Uses a synchronized bounded channel (16-chunk buffer) between reader/formatter threads and the ZIP writer thread.
-* **Why it matters:** Overlaps disk read I/O, XML formatting, Zlib Deflate compression, and disk write I/O. Caps maximum memory usage at **~60 MB RAM** regardless of dataset size (1 Million or 100 Million rows).
 
 ---
 
-## 📈 Performance Evolution & Optimization Timeline
+## ⚡ Key Architectural Modules & Data Flow
+
+### 1. Database Connection & Query Extraction
+* **SQL Parsing:** Uses regex matching `(?:FROM|JOIN)\s+\[?([a-zA-Z0-9_]+)\]?\s*\.\s*\[?[a-zA-Z0-9_]+\]?\s*\.\s*\[?[a-zA-Z0-9_]+\]?` to automatically extract the target database name (e.g., `SOLReporting` from `SOLReporting.Suca.LogisticReport`).
+* **Connection String:** Connects via C-Native ODBC Driver 17 with 32 KB packet size.
+
+### 2. Standard Input Pipe IPC (`subprocess.Popen`)
+* **Zero Disk Writes:** PyArrow writes CSV batches to `proc.stdin` via `subprocess.Popen([binary, "-o", output_file], stdin=subprocess.PIPE, bufsize=2*1024*1024)`.
+* **Zero Memory Copy:** Data flows over the operating system pipe buffer without writing intermediate disk files.
+
+### 3. Rust Producer Thread (`BufReader` + Column Inference)
+* **Stdin Locking:** Locks `stdin` inside the spawned thread closure (`std::io::stdin().lock()`) to ensure thread-safe ingestion.
+* **Auto Type Classification:** Inspects the first 300 rows to differentiate numeric float columns from text columns.
+* **Finite Float Inspection:** Evaluates numeric values using `.is_finite()`. Valid floats write to `<c><v>...</v></c>`, while `NaN` / `Infinity` gracefully fall back to inline string tags `<is><t>NaN</t></is>` without corrupting Excel.
+* **XML 1.0 Sanitization:** Strips illegal control characters (`0x00..0x1F` except `\t`, `\n`, `\r`) to guarantee 100% Excel compatibility and prevent "Repaired Records" warnings.
+
+### 4. Rust Writer Thread & Dynamic Metadata
+* **Compact OpenXML Payload:** Uses `inlineStr` (`<c t="inlineStr">`) and strips unnecessary cell coordinates (`r="A1"`) per ISO/IEC 29500 standards, reducing uncompressed XML size by 68%.
+* **Dynamic Worksheet Rotation:** Automatically partitions streams at 1,048,575 rows per sheet (`sheet1.xml`, `sheet2.xml`, ...).
+* **Dynamic Metadata Generation:** At stream completion, writes `[Content_Types].xml`, `xl/workbook.xml`, and `xl/_rels/workbook.xml.rels` dynamically based on the exact number of active worksheets created.
+
+### 5. Isolated Telemetry & Timing Breakdown
+* Measures and logs:
+  - **SQL Server TTFB:** Query execution & first batch delivery latency.
+  - **SQL Fetch Time:** Time spent pulling Arrow batches from SQL Server over the network.
+  - **Rust Pipe Conversion Time:** Time spent converting Arrow batches into OpenXML and compressing the `.xlsx` file.
+
+---
+
+## 📈 Performance Evolution & Optimization Milestones
 
 | Iteration | Strategy Applied | Total Runtime | Throughput | Output File Size | RAM Usage |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -47,4 +129,5 @@
 | **Iteration 2** | Pipelined Bounded Producer-Consumer Architecture | 5.45s | 211,000 rows/s | 1.7 GB | ~120 MB |
 | **Iteration 3** | Zero-Alloc `ByteRecord` + Stack Integer Formatting | 5.22s | 220,000 rows/s | 1.7 GB | ~120 MB |
 | **Iteration 4** | Compact ISO OpenXML Payload Stripping | 4.11s | 280,000 rows/s | 70.47 MB | ~120 MB |
-| **Final Milestone** | **Multi-Threaded Parallel CSV-to-XML Engine** | **1.50s** | **758,960 rows/s** | **70.47 MB** | **~60 MB** |
+| **Iteration 5** | **Multi-Threaded Parallel CSV Engine (`fast_csv`)** | **1.50s** | **758,960 rows/s** | **70.47 MB** | **~60 MB** |
+| **Final Pipe** | **Direct Stdin Stream Engine (`fast_csv_pipe`)** | **~1.80s** | **~550,000 rows/s** | **70.47 MB** | **~60 MB** |
