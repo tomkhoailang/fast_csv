@@ -119,55 +119,68 @@ fn render_rows_parallel(
     chunk_results.concat().into_bytes()
 }
 
-fn read_and_align_csvs(csv_paths: &[String]) -> (Vec<String>, Vec<Vec<String>>) {
+fn read_and_align_csvs_parallel(csv_paths: &[String]) -> (Vec<String>, Vec<Vec<String>>) {
+    // 1. Read headers from all CSV files concurrently in parallel
+    let file_headers_list: Vec<Vec<String>> = csv_paths
+        .par_iter()
+        .map(|path| {
+            let mut rdr = csv::ReaderBuilder::new()
+                .has_headers(true)
+                .flexible(true)
+                .from_path(path)
+                .unwrap_or_else(|e| panic!("Failed to open CSV file {}: {}", path, e));
+            rdr.headers()
+                .expect("Failed to read headers")
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .collect();
+
     let mut headers = Vec::new();
     let mut header_set = HashSet::new();
-
-    for path in csv_paths {
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .flexible(true)
-            .from_path(path)
-            .unwrap_or_else(|e| panic!("Failed to open CSV file {}: {}", path, e));
-
-        let hdr = rdr.headers().expect("Failed to read headers");
-        for h in hdr {
-            let h_str = h.to_string();
-            if !header_set.contains(&h_str) {
-                header_set.insert(h_str.clone());
-                headers.push(h_str);
+    for f_hdrs in &file_headers_list {
+        for h in f_hdrs {
+            if !header_set.contains(h) {
+                header_set.insert(h.clone());
+                headers.push(h.clone());
             }
         }
     }
 
-    let mut all_rows = Vec::new();
+    // 2. Read and align CSV rows concurrently across CPU threads
+    let file_rows_list: Vec<Vec<Vec<String>>> = csv_paths
+        .par_iter()
+        .zip(file_headers_list.par_iter())
+        .map(|(path, file_headers)| {
+            let mut rdr = csv::ReaderBuilder::new()
+                .has_headers(true)
+                .flexible(true)
+                .from_path(path)
+                .unwrap_or_else(|e| panic!("Failed to open CSV file {}: {}", path, e));
 
-    for path in csv_paths {
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .flexible(true)
-            .from_path(path)
-            .unwrap_or_else(|e| panic!("Failed to open CSV file {}: {}", path, e));
+            let header_map: Vec<usize> = file_headers
+                .iter()
+                .map(|fh| headers.iter().position(|h| h == fh).unwrap())
+                .collect();
 
-        let file_headers: Vec<String> = rdr.headers().unwrap().iter().map(|s| s.to_string()).collect();
-        let header_map: Vec<usize> = file_headers
-            .iter()
-            .map(|fh| headers.iter().position(|h| h == fh).unwrap())
-            .collect();
-
-        for result in rdr.records() {
-            let record = result.expect("Failed to read CSV record");
-            let mut aligned_row = vec![String::new(); headers.len()];
-            for (idx, val) in record.iter().enumerate() {
-                if idx < header_map.len() {
-                    let target_idx = header_map[idx];
-                    aligned_row[target_idx] = val.to_string();
+            let mut file_rows = Vec::new();
+            for result in rdr.records() {
+                let record = result.expect("Failed to read CSV record");
+                let mut aligned_row = vec![String::new(); headers.len()];
+                for (idx, val) in record.iter().enumerate() {
+                    if idx < header_map.len() {
+                        let target_idx = header_map[idx];
+                        aligned_row[target_idx] = val.to_string();
+                    }
                 }
+                file_rows.push(aligned_row);
             }
-            all_rows.push(aligned_row);
-        }
-    }
+            file_rows
+        })
+        .collect();
 
+    let all_rows: Vec<Vec<String>> = file_rows_list.into_iter().flatten().collect();
     (headers, all_rows)
 }
 
@@ -188,12 +201,12 @@ fn main() {
         )
     };
 
-    println!("[START] High-Performance Native Rust Converter");
+    println!("[START] High-Performance Native Rust Parallel Reader & Writer");
     let t_start = Instant::now();
 
-    println!("[READ] Reading and aligning {} CSV files...", csv_files.len());
+    println!("[READ] Reading and aligning {} CSV files in parallel across threads...", csv_files.len());
     let t_read_start = Instant::now();
-    let (headers, rows) = read_and_align_csvs(&csv_files);
+    let (headers, rows) = read_and_align_csvs_parallel(&csv_files);
     let t_read = t_read_start.elapsed();
     println!("[READ COMPLETE] Read {} rows in {:.4}s", rows.len(), t_read.as_secs_f64());
 
