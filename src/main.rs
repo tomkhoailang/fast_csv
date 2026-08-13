@@ -31,6 +31,8 @@ fn escape_xml_bytes(s: &[u8], out: &mut String) {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
+            '\r' | '\n' | '\t' => out.push(c),
+            c if (c as u32) < 0x20 => {}, // Strip illegal XML 1.0 control characters
             _ => out.push(c),
         }
     }
@@ -69,8 +71,10 @@ fn classify_columns_from_sample(csv_paths: &[String], headers: &[String]) -> Vec
                     let s = std::str::from_utf8(val_bytes).unwrap_or("").trim();
                     if !s.is_empty() {
                         total_non_empty += 1;
-                        if s.parse::<f64>().is_ok() {
-                            numeric_count += 1;
+                        if let Ok(n) = s.parse::<f64>() {
+                            if n.is_finite() {
+                                numeric_count += 1;
+                            }
                         }
                     }
                 }
@@ -201,9 +205,22 @@ fn main() {
                     }
 
                     if col_types[target_idx] == ColType::Numeric {
-                        buf.push_str("<c><v>");
-                        buf.push_str(std::str::from_utf8(val_bytes).unwrap_or(""));
-                        buf.push_str("</v></c>");
+                        let val_str = std::str::from_utf8(val_bytes).unwrap_or("").trim();
+                        if let Ok(n) = val_str.parse::<f64>() {
+                            if n.is_finite() {
+                                buf.push_str("<c><v>");
+                                buf.push_str(val_str);
+                                buf.push_str("</v></c>");
+                            } else {
+                                buf.push_str("<c t=\"inlineStr\"><is><t>");
+                                escape_xml_bytes(val_bytes, &mut buf);
+                                buf.push_str("</t></is></c>");
+                            }
+                        } else {
+                            buf.push_str("<c t=\"inlineStr\"><is><t>");
+                            escape_xml_bytes(val_bytes, &mut buf);
+                            buf.push_str("</t></is></c>");
+                        }
                     } else {
                         buf.push_str("<c t=\"inlineStr\"><is><t>");
                         escape_xml_bytes(val_bytes, &mut buf);

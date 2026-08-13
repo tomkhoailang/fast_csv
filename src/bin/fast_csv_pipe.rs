@@ -30,6 +30,8 @@ fn escape_xml_bytes(s: &[u8], out: &mut String) {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
+            '\r' | '\n' | '\t' => out.push(c),
+            c if (c as u32) < 0x20 => {}, // Strip illegal XML 1.0 control characters
             _ => out.push(c),
         }
     }
@@ -125,8 +127,10 @@ fn main() {
                                     let val = std::str::from_utf8(&r[c_idx]).unwrap_or("").trim();
                                     if !val.is_empty() {
                                         non_empty += 1;
-                                        if val.parse::<f64>().is_ok() {
-                                            num_count += 1;
+                                        if let Ok(n) = val.parse::<f64>() {
+                                            if n.is_finite() {
+                                                num_count += 1;
+                                            }
                                         }
                                     }
                                 }
@@ -148,9 +152,22 @@ fn main() {
                                 continue;
                             }
                             if col_types[c_idx] == ColType::Numeric {
-                                buf.push_str("<c><v>");
-                                buf.push_str(std::str::from_utf8(val_bytes).unwrap_or(""));
-                                buf.push_str("</v></c>");
+                                let val_str = std::str::from_utf8(val_bytes).unwrap_or("").trim();
+                                if let Ok(n) = val_str.parse::<f64>() {
+                                    if n.is_finite() {
+                                        buf.push_str("<c><v>");
+                                        buf.push_str(val_str);
+                                        buf.push_str("</v></c>");
+                                    } else {
+                                        buf.push_str("<c t=\"inlineStr\"><is><t>");
+                                        escape_xml_bytes(val_bytes, &mut buf);
+                                        buf.push_str("</t></is></c>");
+                                    }
+                                } else {
+                                    buf.push_str("<c t=\"inlineStr\"><is><t>");
+                                    escape_xml_bytes(val_bytes, &mut buf);
+                                    buf.push_str("</t></is></c>");
+                                }
                             } else {
                                 buf.push_str("<c t=\"inlineStr\"><is><t>");
                                 escape_xml_bytes(val_bytes, &mut buf);
@@ -171,9 +188,22 @@ fn main() {
                     continue;
                 }
                 if col_types[c_idx] == ColType::Numeric {
-                    buf.push_str("<c><v>");
-                    buf.push_str(std::str::from_utf8(val_bytes).unwrap_or(""));
-                    buf.push_str("</v></c>");
+                    let val_str = std::str::from_utf8(val_bytes).unwrap_or("").trim();
+                    if let Ok(n) = val_str.parse::<f64>() {
+                        if n.is_finite() {
+                            buf.push_str("<c><v>");
+                            buf.push_str(val_str);
+                            buf.push_str("</v></c>");
+                        } else {
+                            buf.push_str("<c t=\"inlineStr\"><is><t>");
+                            escape_xml_bytes(val_bytes, &mut buf);
+                            buf.push_str("</t></is></c>");
+                        }
+                    } else {
+                        buf.push_str("<c t=\"inlineStr\"><is><t>");
+                        escape_xml_bytes(val_bytes, &mut buf);
+                        buf.push_str("</t></is></c>");
+                    }
                 } else {
                     buf.push_str("<c t=\"inlineStr\"><is><t>");
                     escape_xml_bytes(val_bytes, &mut buf);
@@ -204,8 +234,10 @@ fn main() {
                             let val = std::str::from_utf8(&r[c_idx]).unwrap_or("").trim();
                             if !val.is_empty() {
                                 non_empty += 1;
-                                if val.parse::<f64>().is_ok() {
-                                    num_count += 1;
+                                if let Ok(n) = val.parse::<f64>() {
+                                    if n.is_finite() {
+                                        num_count += 1;
+                                    }
                                 }
                             }
                         }
@@ -226,9 +258,22 @@ fn main() {
                         continue;
                     }
                     if col_types[c_idx] == ColType::Numeric {
-                        buf.push_str("<c><v>");
-                        buf.push_str(std::str::from_utf8(val_bytes).unwrap_or(""));
-                        buf.push_str("</v></c>");
+                        let val_str = std::str::from_utf8(val_bytes).unwrap_or("").trim();
+                        if let Ok(n) = val_str.parse::<f64>() {
+                            if n.is_finite() {
+                                buf.push_str("<c><v>");
+                                buf.push_str(val_str);
+                                buf.push_str("</v></c>");
+                            } else {
+                                buf.push_str("<c t=\"inlineStr\"><is><t>");
+                                escape_xml_bytes(val_bytes, &mut buf);
+                                buf.push_str("</t></is></c>");
+                            }
+                        } else {
+                            buf.push_str("<c t=\"inlineStr\"><is><t>");
+                            escape_xml_bytes(val_bytes, &mut buf);
+                            buf.push_str("</t></is></c>");
+                        }
                     } else {
                         buf.push_str("<c t=\"inlineStr\"><is><t>");
                         escape_xml_bytes(val_bytes, &mut buf);
