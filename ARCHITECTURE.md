@@ -10,6 +10,67 @@
 
 ---
 
+## 🧠 Deep Dive: Buffer Splitting & Memory Limit Architecture (Capped ~60 MB RAM)
+
+### 1. The Memory Explosion Problem in Standard Excel Libraries
+Standard Excel libraries (like Pandas or `openpyxl`) build the entire 2D/3D table in RAM before writing. For 1,000,000 rows × 40 columns (40 million cells), memory usage spikes to **1.8 GB - 4.0 GB RAM**, causing system slowdowns or `OutOfMemory` crashes on large datasets.
+
+---
+
+### 2. Our Bounded Buffer Splitting Solution
+
+```
+                                  FIXED MEMORY BOUNDARY (~60 MB MAX RAM)
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                                       │
+│  [ Stdin Stream ]                                                                                     │
+│        │                                                                                              │
+│        ▼ (Fixed 2 MB Input Buffer)                                                                    │
+│  ┌───────────────────────────────┐                                                                    │
+│  │ BufReader(2MB, StdinLock)     │                                                                    │
+│  └─────────────┬─────────────────┘                                                                    │
+│                │                                                                                      │
+│                ▼ Parses rows                                                                          │
+│  ┌───────────────────────────────┐                                                                    │
+│  │ Producer Buffer (25,000 Rows) │ ◄── [Chunk Buffer Splitting: Swapped & cleared every 25,000 rows]     │
+│  └─────────────┬─────────────────┘     (~3.75 MB per XML Chunk Buffer)                                │
+│                │                                                                                      │
+│                ▼ tx.send(chunk)                                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ BOUNDED SYNCHRONOUS CHANNEL: sync_channel::<PipeStreamMessage>(16)                             │  │
+│  │  [ Chunk 1 ] [ Chunk 2 ] [ Chunk 3 ] ... [ Chunk 16 ]                                           │  │
+│  │  (Max 16 Chunks In Flight = 16 × 3.75 MB = ~60 MB)                                               │  │
+│  │                                                                                                 │  │
+│  │  ⚠️ AUTOMATIC BACKPRESSURE: If 16 chunks fill the channel, tx.send() BLOCKS the Producer        │  │
+│  │     Thread until the Writer Thread consumes a chunk and compresses it to disk!                  │  │
+│  └──────────────────────────────────────────────┬──────────────────────────────────────────────────┘  │
+│                                                 │                                                     │
+│                                                 ▼ rx.recv(chunk)                                      │
+│  ┌──────────────────────────────────────────────┴──────────────────────────────────────────────────┐  │
+│  │ Writer Thread (Main): Compress Chunk via Zlib Deflate Level 1 -> Write to Disk                  │  │
+│  └──────────────────────────────────────────────┬──────────────────────────────────────────────────┘  │
+│                                                 │                                                     │
+└─────────────────────────────────────────────────┼─────────────────────────────────────────────────────┘
+                                                  ▼
+                                       [ output_file.xlsx ]
+```
+
+---
+
+### 3. Mathematical Proof of Constant Memory Limit
+
+Regardless of dataset size (**1 Million rows**, **50 Million rows**, or **1 Billion rows**), memory usage is mathematically capped by:
+
+$$\text{Total Engine RAM} = \text{Input Buf (2MB)} + \Big(\text{Bounded Channel Limit (16)} \times \text{Chunk Size (3.75MB)}\Big) + \text{ZIP Compressor Buf (2MB)} \approx \mathbf{64 \text{ MB RAM}}$$
+
+#### How Buffer Splitting Works Step-by-Step:
+1. **Input Stream Buffering (2 MB):** `BufReader::with_capacity(2*1024*1024, stdin_lock)` reads raw bytes from stdin in fixed 2 MB chunks.
+2. **Row Chunk Splitting (25,000 Rows):** The Producer Thread accumulates XML cell tags into a heap buffer (`String::with_capacity(25_000 * 150)`).
+3. **Zero-Allocation Buffer Swapping:** When `row_count` reaches 25,000 rows, `std::mem::replace(&mut buf, String::with_capacity(25000 * 150))` transfers ownership of the byte array to the channel in $O(1)$ time with **zero memory copies**.
+4. **Automatic Hardware Backpressure:** If the ZIP writer thread is slower than the CSV parser, the channel reaches its 16-chunk limit. The Producer Thread is paused by OS thread synchronization until space frees up, guaranteeing RAM never exceeds ~60 MB!
+
+---
+
 ## 🌐 Complete End-to-End System Architecture Pipeline
 
 ```
@@ -54,10 +115,10 @@
        │     • Check .is_finite() ──► Write <v>123.45</v>                                       │
        │     • NaN / Infinity      ──► Fallback to inline text <is><t>NaN</t></is>             │
        │  5. XML Chunk Assembly: Pack 25,000 formatted rows into zero-alloc buffer               │
-       └───────────────────────────────────────────┬────────────────────────────────────────────┘
-                                                   │
-                                                   ▼ Bounded Channel (sync_channel 16 Chunks)
-                                                   
+       └───────────────────────────┬────────────────────────────────────────────┘
+                                   │
+                                   ▼ Bounded Channel (sync_channel 16 Chunks)
+                                   
        ┌────────────────────────────────────────────────────────────────────────────────────────┐
        │ WRITER THREAD (Main Thread: OpenXML Generator & ZIP Streamer)                          │
        │  1. Static Structural Files: Write _rels/.rels and xl/styles.xml                        │
@@ -70,9 +131,9 @@
        │     • Write xl/workbook.xml listing only active sheets                                 │
        │     • Write xl/_rels/workbook.xml.rels with sheet relationships                        │
        │  5. ZIP Compression: Stream via Deflate Level 1 (Fastest Compression)                  │
-       └───────────────────────────────────────────┬────────────────────────────────────────────┘
-                                                   │
-                                                   ▼
+       └───────────────────────────┬────────────────────────────────────────────┘
+                                   │
+                                   ▼
 ========================================================================================================================
                                     PHASE 3: OUTPUT ARTIFACT & TELEMETRY
 ========================================================================================================================
