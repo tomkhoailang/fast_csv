@@ -61,19 +61,17 @@ fn main() {
 
     let filtered_args: Vec<String> = args.into_iter().filter(|a| a != "--store").collect();
 
-    let explicit_types: Option<Vec<ColType>> = if let Some(pos) = filtered_args.iter().position(|a| a == "--types") {
+    let explicit_types: Vec<ColType> = if let Some(pos) = filtered_args.iter().position(|a| a == "--types") {
         if pos + 1 < filtered_args.len() {
-            Some(
-                filtered_args[pos + 1]
-                    .split(',')
-                    .map(|t| if t.trim() == "N" { ColType::Numeric } else { ColType::Text })
-                    .collect(),
-            )
+            filtered_args[pos + 1]
+                .split(',')
+                .map(|t| if t.trim() == "N" { ColType::Numeric } else { ColType::Text })
+                .collect()
         } else {
-            None
+            panic!("Error: --types argument must be followed by a comma-separated list of types (N or T)");
         }
     } else {
-        None
+        panic!("Error: --types argument is required (e.g., --types N,T,N)");
     };
 
     let output_path = if let Some(pos) = filtered_args.iter().position(|a| a == "-o") {
@@ -95,11 +93,7 @@ fn main() {
     };
 
     println!("[START] Dedicated Stdin Pipe Engine [{}]", mode_label);
-    if explicit_types.is_some() {
-        println!("[SCHEMA] Exact PyArrow column types provided (Zero sample buffering!)");
-    } else {
-        println!("[SCHEMA] Auto-classifying column types from first 300 rows...");
-    }
+    println!("[SCHEMA] Exact PyArrow column types provided (Zero sample buffering!)");
     println!("[INPUT STREAM] Listening on Stdin pipe...");
     println!("[OUTPUT FILE] Writing XLSX to: {}", output_path);
 
@@ -125,91 +119,20 @@ fn main() {
         let num_cols = headers.len();
         tx.send(PipeStreamMessage::Header(headers)).unwrap();
 
-        let (mut col_types, mut classified) = if let Some(types) = explicit_types {
-            if types.len() == num_cols {
-                (types, true)
-            } else {
-                (vec![ColType::Text; num_cols], false)
-            }
+        let col_types = if explicit_types.len() == num_cols {
+            explicit_types
         } else {
-            (vec![ColType::Text; num_cols], false)
+            panic!("Error: --types count ({}) does not match column count ({})", explicit_types.len(), num_cols);
         };
 
         let mut record = ByteRecord::new();
         let chunk_row_limit = 25_000;
         let mut buf = String::with_capacity(chunk_row_limit * 150);
         let mut row_count = 0;
-        let mut sample_records = Vec::new();
 
         while rdr.read_byte_record(&mut record).unwrap_or(false) {
             // Skip repeated header rows from concatenated CSV streams
             if record.len() == header_bytes.len() && record.iter().zip(&header_bytes).all(|(b, hb)| b == hb.as_slice()) {
-                continue;
-            }
-
-            if !classified {
-                sample_records.push(record.iter().map(|b| b.to_vec()).collect::<Vec<Vec<u8>>>());
-                if sample_records.len() >= 300 {
-                    col_types = (0..num_cols)
-                        .map(|c_idx| {
-                            let mut num_count = 0;
-                            let mut non_empty = 0;
-                            for r in &sample_records {
-                                if c_idx < r.len() {
-                                    let val = std::str::from_utf8(&r[c_idx]).unwrap_or("").trim();
-                                    if !val.is_empty() {
-                                        non_empty += 1;
-                                        if let Ok(n) = val.parse::<f64>() {
-                                            if n.is_finite() {
-                                                num_count += 1;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if non_empty > 0 && num_count == non_empty {
-                                ColType::Numeric
-                            } else {
-                                ColType::Text
-                            }
-                        })
-                        .collect();
-                    classified = true;
-
-                    for sample_rec in sample_records.drain(..) {
-                        buf.push_str("<row>");
-                        for (c_idx, val_bytes) in sample_rec.iter().enumerate() {
-                            if val_bytes.is_empty() {
-                                buf.push_str("<c/>");
-                                continue;
-                            }
-                            if col_types[c_idx] == ColType::Numeric {
-                                let val_str = std::str::from_utf8(val_bytes).unwrap_or("").trim();
-                                if let Ok(n) = val_str.parse::<f64>() {
-                                    if n.is_finite() {
-                                        buf.push_str("<c><v>");
-                                        buf.push_str(val_str);
-                                        buf.push_str("</v></c>");
-                                    } else {
-                                        buf.push_str("<c t=\"inlineStr\"><is><t>");
-                                        escape_xml_bytes(val_bytes, &mut buf);
-                                        buf.push_str("</t></is></c>");
-                                    }
-                                } else {
-                                    buf.push_str("<c t=\"inlineStr\"><is><t>");
-                                    escape_xml_bytes(val_bytes, &mut buf);
-                                    buf.push_str("</t></is></c>");
-                                }
-                            } else {
-                                buf.push_str("<c t=\"inlineStr\"><is><t>");
-                                escape_xml_bytes(val_bytes, &mut buf);
-                                buf.push_str("</t></is></c>");
-                            }
-                        }
-                        buf.push_str("</row>");
-                        row_count += 1;
-                    }
-                }
                 continue;
             }
 
@@ -253,67 +176,6 @@ fn main() {
                 })
                 .unwrap();
                 row_count = 0;
-            }
-        }
-
-        if !classified && !sample_records.is_empty() {
-            col_types = (0..num_cols)
-                .map(|c_idx| {
-                    let mut num_count = 0;
-                    let mut non_empty = 0;
-                    for r in &sample_records {
-                        if c_idx < r.len() {
-                            let val = std::str::from_utf8(&r[c_idx]).unwrap_or("").trim();
-                            if !val.is_empty() {
-                                non_empty += 1;
-                                if let Ok(n) = val.parse::<f64>() {
-                                    if n.is_finite() {
-                                        num_count += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if non_empty > 0 && num_count == non_empty {
-                        ColType::Numeric
-                    } else {
-                        ColType::Text
-                    }
-                })
-                .collect();
-
-            for sample_rec in sample_records {
-                buf.push_str("<row>");
-                for (c_idx, val_bytes) in sample_rec.iter().enumerate() {
-                    if val_bytes.is_empty() {
-                        buf.push_str("<c/>");
-                        continue;
-                    }
-                    if col_types[c_idx] == ColType::Numeric {
-                        let val_str = std::str::from_utf8(val_bytes).unwrap_or("").trim();
-                        if let Ok(n) = val_str.parse::<f64>() {
-                            if n.is_finite() {
-                                buf.push_str("<c><v>");
-                                buf.push_str(val_str);
-                                buf.push_str("</v></c>");
-                            } else {
-                                buf.push_str("<c t=\"inlineStr\"><is><t>");
-                                escape_xml_bytes(val_bytes, &mut buf);
-                                buf.push_str("</t></is></c>");
-                            }
-                        } else {
-                            buf.push_str("<c t=\"inlineStr\"><is><t>");
-                            escape_xml_bytes(val_bytes, &mut buf);
-                            buf.push_str("</t></is></c>");
-                        }
-                    } else {
-                        buf.push_str("<c t=\"inlineStr\"><is><t>");
-                        escape_xml_bytes(val_bytes, &mut buf);
-                        buf.push_str("</t></is></c>");
-                    }
-                }
-                buf.push_str("</row>");
-                row_count += 1;
             }
         }
 
