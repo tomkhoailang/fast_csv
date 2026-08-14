@@ -79,6 +79,17 @@ output_file = run_query(
 )
 ```
 
+## 🧠 How Backpressure & Capped RAM Works
+
+When streaming database queries from Python to `fast_csv_pipe` via standard input (`stdin`), memory usage is capped at **~60 MB RAM** regardless of the dataset size (whether 1M or 100M+ rows). This is achieved via automatic, OS-level cascading backpressure:
+
+1. **Rust Channel Bounding:** If the single-threaded ZIP writer is slower than the CSV parsing thread, the `sync_channel(16)` fills up.
+2. **Rust Reader Pause:** Once the channel is full, the Rust parser pauses at `.send()`, which in turn halts the Rust reader thread from pulling new bytes from `stdin`.
+3. **OS Pipe Blocking:** Because the Rust process is no longer reading from the standard input pipe, the operating system's internal pipe buffer fills up.
+4. **Python Pause:** Once the OS pipe buffer is full, Python's underlying OS `write()` system call blocks. The Python script is automatically paused inside `writer.write_batch(batch)` and does not fetch new rows from SQL Server until the Rust writer catches up, frees space in the channel, and resumes reading from the pipe.
+
+This cascade of blocking ensures optimal CPU utilization and zero memory spikes without needing any custom synchronization logic.
+
 ---
 
 ## 📊 Benchmark Comparison
