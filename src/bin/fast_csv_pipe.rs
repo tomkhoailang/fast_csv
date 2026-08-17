@@ -181,7 +181,8 @@ impl<W: Write + Seek> ExcelStreamWriter<W> {
         let mut zip = zip::ZipWriter::new(writer);
         let zip_options = SimpleFileOptions::default()
             .compression_method(compression_method)
-            .compression_level(level);
+            .compression_level(level)
+            .large_file(true);
 
         // Write xl/workbook relations setup
         let rels_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
